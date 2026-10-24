@@ -223,3 +223,7 @@ zeopp
 
 AGENTS.md
 CLAUDE.md
+.DS_Store
+run2/
+generated_test.csv
+checkpoints/

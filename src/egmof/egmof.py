@@ -409,6 +409,7 @@ class EGMOF:
         batch_size: int = 256,
         num_workers: int = 0,
         return_descriptor: bool = False,
+        single_ligand: bool = False,
     ) -> Union[pd.DataFrame, List[str]]:
         """Generate MOF structures from target property.
 
@@ -427,6 +428,8 @@ class EGMOF:
             batch_size: Batch size for inference
             num_workers: Num workers for DataLoader
             return_descriptor: If True, also return predicted descriptors DataFrame
+            single_ligand: If True, keep only MOFs with exactly one kind of organic
+                ligand (the best-matching ligand by WMSE is chosen)
 
         Returns:
             DataFrame with generated MOFs (if output_type='df') or list of MOF names.
@@ -488,6 +491,7 @@ class EGMOF:
             device=device,
             return_descriptor=return_descriptor,
             feature_names=self._desc2mof_feature_names,
+            single_ligand=single_ligand,
         )
 
         print(f"Generated {len(valid_df)} valid MOFs out of {num_samples}")
@@ -512,6 +516,7 @@ class EGMOF:
         build_cif: bool = False,
         cif_dir: Optional[str | Path] = None,
         new_bb_dir: Optional[str | Path] = None,
+        single_ligand: bool = False,
     ) -> pd.DataFrame:
         """Generate MOF structures, optionally building CIF files.
 
@@ -527,6 +532,7 @@ class EGMOF:
             build_cif: If True, run make_bb + build MOF CIF for each generated MOF
             cif_dir: Directory to save CIF files (required if build_cif=True)
             new_bb_dir: Directory for custom BB xyz files (default: builder/new_bbs)
+            single_ligand: If True, only MOFs with one kind of organic ligand
 
         Returns:
             DataFrame with filename, wmse, pred_value (+ descriptors if return_descriptor=True).
@@ -542,6 +548,7 @@ class EGMOF:
             batch_size=batch_size,
             num_workers=num_workers,
             return_descriptor=return_descriptor,
+            single_ligand=single_ligand,
         )
 
         if not build_cif:

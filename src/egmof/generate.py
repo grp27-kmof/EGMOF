@@ -42,6 +42,30 @@ def _parse_mof_output(all_output: list, SEP_TOKEN_ID: int):
     return _is_valid(all_output, SEP_TOKEN_ID)
 
 
+def count_ligands(seq, SEP_TOKEN_ID: int) -> int:
+    """Number of DISTINCT organic ligands in one Desc2MOF token sequence.
+
+    Token layout:  topo, [CN] bb [SEP], [CN] bb [SEP], ...
+    Metal building blocks (metal_node.txt / metal_edge.txt) are ONE token.
+    Organic building blocks are always SELFIES = several tokens ([Lr] = connection point).
+    So every segment with more than one token is an organic ligand.
+    """
+    from .desc2mof.dataset import EOS_TOKEN, PAD_TOKEN, CN_IDS
+
+    body = [t for t in seq if t not in (EOS_TOKEN, PAD_TOKEN)][1:]  # drop topology token
+    segments, cur = [], []
+    for t in body:
+        if t == SEP_TOKEN_ID:
+            segments.append(cur)
+            cur = []
+        elif t not in CN_IDS:
+            cur.append(t)
+    if cur:
+        segments.append(cur)
+    organic = {tuple(seg) for seg in segments if len(seg) > 1}
+    return len(organic)
+
+
 def run_desc2mof(
     model,
     target_desc: torch.Tensor,
@@ -103,8 +127,14 @@ def run_mof2desc_and_select(
     device: str = "cuda",
     return_descriptor: bool = False,
     feature_names: list[str] | None = None,
+    single_ligand: bool = False,
 ):
-    """Run mof2desc, compute wmse, and select best MOFs."""
+    """Run mof2desc, compute wmse, and select best MOFs.
+
+    single_ligand=True: a beam candidate is valid only if it contains exactly ONE kind
+    of organic ligand. Among the valid candidates of each descriptor the lowest-WMSE
+    one is kept, i.e. the ligand that best matches the target descriptor wins.
+    """
     from .desc2mof import SEP_TOKEN
     from .mof2desc import Desc2MOFOutputDataset
     from .desc2mof import decode_token2mof
@@ -113,6 +143,16 @@ def run_mof2desc_and_select(
     model.eval()
 
     valid_mask, log_list = _parse_mof_output(all_output, SEP_TOKEN_ID=SEP_TOKEN)
+
+    # ── single-ligand rule ──────────────────────────────────────────────
+    n_lig = np.array([count_ligands(seq, SEP_TOKEN) for seq in all_output])
+    if single_ligand:
+        print(
+            f"single-ligand filter: {(valid_mask & (n_lig == 1)).sum()} of "
+            f"{valid_mask.sum()} valid beam candidates have exactly 1 ligand"
+        )
+        valid_mask = valid_mask & (n_lig == 1)
+
     any_valid_mask = valid_mask.reshape(-1, topk).any(axis=1)
 
     x_np = np.array(target_data.x.squeeze(-1))
@@ -169,6 +209,7 @@ def run_mof2desc_and_select(
     best_mof_names = mof_names_reshaped[row_idx, min_indices]
 
     result_df = pd.DataFrame({"filename": best_mof_names})
+    result_df["n_ligands"] = n_lig.reshape(-1, topk)[row_idx, min_indices]
     if best_wmse is not None:
         result_df["wmse"] = best_wmse
 

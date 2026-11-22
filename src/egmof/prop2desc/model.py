@@ -158,8 +158,14 @@ class Prop2Desc(LightningModule):
         target: Any = None,
         return_trajectory: bool = False,
         latent: Optional[torch.Tensor] = None,
+        noise_scale: float = 1.0,
     ) -> torch.Tensor:
-        """Generate descriptors by running reverse diffusion."""
+        """Generate descriptors by running reverse diffusion.
+
+        Args:
+            noise_scale: Multiplier on the per-step DDPM noise ``sigma_t * z``
+                (1.0 = standard ancestral sampling; < 1 sharper, > 1 more diverse).
+        """
         decode = self.decode
 
         if self.condition is None:
@@ -202,7 +208,7 @@ class Prop2Desc(LightningModule):
             model_mean = (1 / torch.sqrt(alpha)) * (
                 x_t_uncond - (1 - alpha) / torch.sqrt(1 - alpha_cumprod) * pred_noise
             )
-            x_t = model_mean + sigma * torch.randn_like(rand_imgs)
+            x_t = model_mean + noise_scale * sigma * torch.randn_like(rand_imgs)
 
             if return_trajectory:
                 trajectory.append(decode(x_t[:, :, : self.dim]))

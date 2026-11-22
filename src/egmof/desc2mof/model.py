@@ -1,4 +1,7 @@
 import os
+import json
+import re
+from pathlib import Path
 import numpy as np
 import math
 import torch
@@ -17,6 +20,7 @@ from .dataset import (
     EOS_TOKEN,
     PAD_TOKEN,
     SEP_TOKEN,
+    CN_IDS,
 )
 
 
@@ -1463,11 +1467,45 @@ class Decoder(nn.Module):
         # NEW: GNMT length penalty 옵션
         use_gnmt_length_penalty: bool = False,
         length_penalty_alpha: float = 0.6,
+        single_linker_constraint: bool = False,
+        decode_mode: str = "beam",
+        top_p: float = 0.9,
     ):
+        """Beam search (decode_mode="beam") or nucleus sampling (decode_mode="sample").
+
+        In sample mode beam_width independent sequences are drawn per descriptor with
+        top-p sampling from softmax(logits / temperature); the same masks (EOS, single-linker
+        constraint) apply. Samples are returned sorted by cumulative log-probability.
+        """
+        if decode_mode not in ("beam", "sample"):
+            raise ValueError(f"decode_mode must be 'beam' or 'sample', got {decode_mode!r}")
         self.eval()
         device = desc.device
         B = desc.size(0)
         V = self.total_vocab_size
+        metal_block_organics = {}
+        if single_linker_constraint:
+            metal_path = Path(__file__).resolve().parent / "data" / "metal_block_organics.json"
+            if metal_path.exists():
+                with metal_path.open("r") as f:
+                    metal_block_organics = json.load(f)
+
+        cn_digits = {}
+        if single_linker_constraint:
+            for token_id, name in MOF_DECODE_DICT.items():
+                match = re.search(r"\[CN_(\d+)\]", str(name))
+                if match:
+                    cn_digits[token_id] = int(match.group(1))
+
+            with open(Path(__file__).resolve().parent / "data" / "metal_node.txt") as f:
+                metal_node_names = set(f.read().split())
+            node_token_ids = {
+                MOF_ENCODE_DICT[name]
+                for name in metal_node_names
+                if name in MOF_ENCODE_DICT
+            }
+            selfies_start = getattr(self, "selfies_start", None)
+            selfies_end = getattr(self, "selfies_end", None)
 
         # ------------------------------------------------------------
         # 1) Encoder
@@ -1563,6 +1601,127 @@ class Decoder(nn.Module):
 
             logits = next_logits(seq_flat, mem_flat, mem_pad_mask_flat)  # (flatN,V)
 
+            if single_linker_constraint:
+                original_logits = logits.clone()
+                topology_token_ids = {
+                    MOF_ENCODE_DICT[name]
+                    for name in (
+                        Path(__file__).resolve().parent / "data" / "topology.txt"
+                    ).read_text().split()
+                    if name in MOF_ENCODE_DICT
+                }
+                protected_ids = {
+                    PAD_TOKEN,
+                    SOS_TOKEN,
+                    EOS_TOKEN,
+                    SEP_TOKEN,
+                    *CN_IDS,
+                    *topology_token_ids,
+                }
+                building_block_ids = (
+                    node_token_ids
+                    | {
+                        MOF_ENCODE_DICT[name]
+                        for name in (
+                            Path(__file__).resolve().parent / "data" / "metal_edge.txt"
+                        ).read_text().split()
+                        if name in MOF_ENCODE_DICT
+                    }
+                    | set(range(selfies_start, selfies_end))
+                    if selfies_start is not None and selfies_end is not None
+                    else node_token_ids
+                )
+
+                fallback_count = 0
+                for row_idx in range(flatN):
+                    seq = seq_flat[row_idx].detach().cpu().tolist()
+                    allowed_building_blocks = set()
+
+                    last_cn_pos = None
+                    last_cn_n = None
+                    for pos in range(len(seq) - 1, -1, -1):
+                        if seq[pos] in cn_digits:
+                            last_cn_pos = pos
+                            last_cn_n = cn_digits[seq[pos]]
+                            break
+
+                    if last_cn_n is not None and last_cn_n >= 3:
+                        content_after_cn = seq[last_cn_pos + 1:]
+                        if not content_after_cn:
+                            chosen_stub_types = set()
+                            for token_id in seq:
+                                name = MOF_DECODE_DICT.get(token_id)
+                                if name in metal_block_organics:
+                                    chosen_stub_types.update(
+                                        metal_block_organics[name].get("linker_stubs", [])
+                                    )
+                            for token_id in node_token_ids:
+                                name = MOF_DECODE_DICT.get(token_id)
+                                entry = metal_block_organics.get(name, {})
+                                if entry.get("has_organic", False):
+                                    continue
+                                stub_types = set(entry.get("linker_stubs", []))
+                                if len(chosen_stub_types | stub_types) <= 1:
+                                    allowed_building_blocks.add(token_id)
+
+                    elif last_cn_n is not None and last_cn_n == 2:
+                        sep_after_cn = any(
+                            seq[pos] == SEP_TOKEN
+                            for pos in range(last_cn_pos + 1, len(seq))
+                        )
+                        if not sep_after_cn:
+                            allowed_building_blocks = set()
+                            e0_id = MOF_ENCODE_DICT.get("E0")
+                            if e0_id is not None:
+                                allowed_building_blocks.add(e0_id)
+                            if selfies_start is not None and selfies_end is not None:
+                                allowed_building_blocks.update(
+                                    range(selfies_start, selfies_end)
+                                )
+
+                            completed_edges = []
+                            current_start = None
+                            for pos, token_id in enumerate(seq):
+                                if token_id in cn_digits and cn_digits[token_id] == 2:
+                                    current_start = pos + 1
+                                elif token_id == SEP_TOKEN and current_start is not None:
+                                    segment = seq[current_start:pos]
+                                    if (
+                                        selfies_start is not None
+                                        and selfies_end is not None
+                                        and segment
+                                        and any(
+                                            selfies_start <= edge_token < selfies_end
+                                            for edge_token in segment
+                                        )
+                                    ):
+                                        completed_edges.append(segment)
+                                    current_start = None
+
+                            if completed_edges:
+                                organic_edge = completed_edges[0]
+                                current_segment = seq[last_cn_pos + 1:]
+                                if len(current_segment) < len(organic_edge):
+                                    allowed_building_blocks = {
+                                        organic_edge[len(current_segment)]
+                                    }
+                                else:
+                                    allowed_building_blocks = set()
+
+                    blocked = building_block_ids - allowed_building_blocks
+                    if blocked:
+                        logits[row_idx, list(blocked)] = -float("inf")
+
+                fallback_rows = torch.isneginf(logits).all(dim=-1)
+                if fallback_rows.any():
+                    fallback_count = int(fallback_rows.sum().item())
+                    logits[fallback_rows] = original_logits[fallback_rows]
+                    if os.environ.get("EGMOF_DEBUG_CONSTRAINT") == "1":
+                        print(
+                            f"EGMOF constraint safety fallback restored "
+                            f"{fallback_count} beam row(s)"
+                        )
+
             # --- EOS 확장 차단 ---
             # 현재 빔이 EOS로 끝났으면, 다음 토큰은 EOS만 가능하게(다른 토큰 확장 불가)
             last_tok = seq_flat[:, -1]
@@ -1572,6 +1731,23 @@ class Decoder(nn.Module):
                 logits[is_done, self.eos_token] = 0.0
 
             logp = torch.log_softmax(logits / temperature, dim=-1)  # (flatN,V)
+
+            if decode_mode == "sample":
+                # nucleus sampling: one token per sequence, sequences stay independent
+                probs = logp.exp()
+                if top_p < 1.0:
+                    sorted_probs, sorted_idx = probs.sort(dim=-1, descending=True)
+                    # keep the smallest prefix whose mass reaches top_p (always >= 1 token)
+                    outside = sorted_probs.cumsum(dim=-1) - sorted_probs > top_p
+                    sorted_probs = sorted_probs.masked_fill(outside, 0.0)
+                    probs = torch.zeros_like(probs).scatter(-1, sorted_idx, sorted_probs)
+                tok = torch.multinomial(probs, num_samples=1).squeeze(-1)  # (flatN,)
+                step_logp = logp.gather(-1, tok.unsqueeze(-1)).squeeze(-1)
+                new_seqs = torch.cat([seqs, tok.view(Bmem, beam, 1)], dim=-1)
+                new_scores_raw = scores_raw + step_logp.view(Bmem, beam)
+                new_lengths = lengths + (~is_done).long().view(Bmem, beam)
+                return new_seqs, new_scores_raw, new_lengths
+
             logp = logp.view(Bmem, beam, V)  # (B,beam,V)
 
             # 후보 raw score
@@ -1627,9 +1803,11 @@ class Decoder(nn.Module):
         # ------------------------------------------------------------
         # 5) Init
         # ------------------------------------------------------------
-        seqs = torch.full((B, 1, 1), self.sos_token, dtype=torch.long, device=device)
-        scores_raw = torch.zeros((B, 1), device=device)
-        lengths = torch.zeros((B, 1), dtype=torch.long, device=device)  # SOS 제외 길이
+        # sample mode starts beam_width independent sequences; beam mode starts from one
+        n_start = beam_width if decode_mode == "sample" else 1
+        seqs = torch.full((B, n_start, 1), self.sos_token, dtype=torch.long, device=device)
+        scores_raw = torch.zeros((B, n_start), device=device)
+        lengths = torch.zeros((B, n_start), dtype=torch.long, device=device)  # SOS 제외 길이
 
         # 첫 스텝
         seqs, scores_raw, lengths = beam_step(
@@ -1639,17 +1817,31 @@ class Decoder(nn.Module):
         # ------------------------------------------------------------
         # 6) Main loop
         # ------------------------------------------------------------
-        for _ in range(max_token_len - 1):
+        for decoding_step in range(max_token_len - 1):
             # 모든 빔이 EOS로 끝났으면 종료
             if (seqs[:, :, -1] == self.eos_token).all():
                 break
             seqs, scores_raw, lengths = beam_step(
                 seqs, scores_raw, lengths, memory, memory_key_padding_mask
             )
+            if (
+                (decoding_step + 1) % 20 == 0
+                and device.type == "mps"
+                and hasattr(torch, "mps")
+                and torch.backends.mps.is_available()
+            ):
+                torch.mps.empty_cache()
 
         # ------------------------------------------------------------
         # 7) Return: top beam_width 전체
         # ------------------------------------------------------------
+        if decode_mode == "sample":
+            # same order convention as beam search: best cumulative log-prob first
+            order = scores_raw.argsort(dim=1, descending=True)
+            seqs = seqs.gather(1, order.unsqueeze(-1).expand_as(seqs))
+            scores_raw = scores_raw.gather(1, order)
+            lengths = lengths.gather(1, order)
+
         final_seqs = seqs[:, :, 1:]  # SOS 제거
 
         # pad/truncate to max_token_len
@@ -1672,6 +1864,27 @@ class Decoder(nn.Module):
             final_scores = scores_raw / gnmt_lp(lengths)
         else:
             final_scores = scores_raw
+
+        if single_linker_constraint and os.environ.get("EGMOF_DEBUG_CONSTRAINT") == "1":
+            first_beams = final_seqs[0].detach().cpu().tolist()
+            decoded_beams = decode_token2mof(first_beams)
+            print("EGMOF constraint debug (first descriptor):")
+            for beam_index, (beam_name, beam_tokens) in enumerate(
+                zip(decoded_beams, first_beams)
+            ):
+                valid_mask, reason_log = is_valid([beam_tokens], SEP_TOKEN)
+                valid = bool(valid_mask[0])
+                reason_text = (
+                    reason_log[0][1]
+                    if reason_log
+                    and isinstance(reason_log[0], (list, tuple))
+                    and len(reason_log[0]) > 1
+                    else "valid"
+                )
+                print(
+                    f"  beam {beam_index}: valid={bool(valid)} "
+                    f"reason={reason_text} name={beam_name}"
+                )
 
         # final_seqs: (B, beam_width, max_token_len)
         # scores_raw: (B, beam_width)  누적 logp
